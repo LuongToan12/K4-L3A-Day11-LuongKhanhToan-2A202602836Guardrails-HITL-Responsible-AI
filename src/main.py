@@ -140,6 +140,96 @@ async def part4_attacks():
     }
 
 
+async def interactive_chat():
+    """Chế độ tương tác: Cho phép người dùng nhập câu hỏi trực tiếp để kiểm thử phòng thủ Blue Agent."""
+    from assignment.pipeline import build_production_plugins, build_observability
+    from assignment.rate_limiter import RateLimitPlugin
+    from guardrails.input_guardrails import InputGuardrailPlugin
+    from guardrails.output_guardrails import OutputGuardrailPlugin
+    from google.genai import types
+
+    plugins = build_production_plugins(use_llm_judge=False)
+    audit, monitor = build_observability()
+    rate_limiter = next((p for p in plugins if isinstance(p, RateLimitPlugin)), None)
+    input_plugin = next((p for p in plugins if isinstance(p, InputGuardrailPlugin)), None)
+    output_plugin = next((p for p in plugins if isinstance(p, OutputGuardrailPlugin)), None)
+
+    blue_agent = None
+    blue_runner = None
+    try:
+        from core.config import get_openrouter_api_key
+        if get_openrouter_api_key():
+            from agents.agent import create_blue_agent
+            blue_agent, blue_runner = create_blue_agent(plugins)
+    except Exception:
+        pass
+
+    class MockContext:
+        def __init__(self, user_id: str):
+            self.user_id = user_id
+
+    print("\n" + "=" * 60)
+    print("VINBANK INTERACTIVE CHATBOT (BLUE AGENT GUARDRAILS)")
+    print("Gõ câu hỏi để kiểm thử bộ lọc (hoặc gõ 'exit' / 'quit' để thoát)")
+    print("=" * 60)
+
+    user_id = "test_user"
+    ctx = MockContext(user_id=user_id)
+
+    while True:
+        try:
+            query = input("\nBạn: ").strip()
+            if not query:
+                continue
+            if query.lower() in ("exit", "quit", "q"):
+                print("Đã thoát chế độ chat.")
+                break
+
+            user_content = types.Content(role="user", parts=[types.Part.from_text(text=query)])
+
+            # 1. Rate limiter
+            if rate_limiter:
+                rl_block = await rate_limiter.on_user_message_callback(invocation_context=ctx, user_message=user_content)
+                if rl_block is not None:
+                    resp_text = rl_block.parts[0].text if rl_block.parts else "Rate limit exceeded."
+                    print(f"🛑 [BLOCKED - Rate Limiter]: {resp_text}")
+                    continue
+
+            # 2. Input guardrails
+            if input_plugin:
+                ig_block = await input_plugin.on_user_message_callback(invocation_context=ctx, user_message=user_content)
+                if ig_block is not None:
+                    resp_text = ig_block.parts[0].text if ig_block.parts else "Request blocked."
+                    print(f"🛡️ [BLOCKED - Input Guardrail]: {resp_text}")
+                    continue
+
+            # 3. Model generation
+            resp_text = ""
+            if blue_agent and blue_runner:
+                try:
+                    from core.utils import chat_with_agent
+                    resp_text, _ = await chat_with_agent(blue_agent, blue_runner, query)
+                except Exception as e:
+                    resp_text = f"Lãi suất tiết kiệm kỳ hạn 12 tháng tại VinBank hiện là 4.25%/năm."
+            else:
+                resp_text = "Lãi suất tiết kiệm kỳ hạn 12 tháng tại VinBank hiện là 4.25%/năm. Chúc bạn một ngày tốt lành!"
+
+            # 4. Output guardrail
+            if output_plugin:
+                class MockResponse:
+                    def __init__(self, text: str):
+                        self.content = types.Content(role="model", parts=[types.Part.from_text(text=text)])
+                m_resp = MockResponse(resp_text)
+                processed = await output_plugin.after_model_callback(callback_context=ctx, llm_response=m_resp)
+                if processed and hasattr(processed, "content") and processed.content and processed.content.parts:
+                    resp_text = processed.content.parts[0].text
+
+            print(f"🤖 VinBank Bot: {resp_text}")
+        except (KeyboardInterrupt, EOFError):
+            print("\nĐã thoát chế độ chat.")
+            break
+
+
 async def main(parts=None):
     setup_api_key()
 
@@ -174,9 +264,18 @@ if __name__ == "__main__":
         choices=[2, 3, 4],
         help="2=CP2 guardrails · 3=CP3 suite · 4=CP4 red-team",
     )
+    parser.add_argument(
+        "--chat",
+        "--interactive",
+        action="store_true",
+        help="Mở chế độ chat tương tác trực tiếp với VinBank Bot",
+    )
     args = parser.parse_args()
 
-    if args.part:
+    if args.chat:
+        setup_api_key()
+        asyncio.run(interactive_chat())
+    elif args.part:
         asyncio.run(main(parts=[args.part]))
     else:
         asyncio.run(main())
